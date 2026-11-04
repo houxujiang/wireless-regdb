@@ -65,12 +65,52 @@ jobs:
               pass
           
           
-          def run(args, *, cwd=None, env=None, data=None):
+          GIT_OPERATIONS = frozenset(("git_command", "atomic_push", "atomic_push_dry_run", "empty_default_seed"))
+          
+          
+          def classify_git_failure(stderr, stdout=b""):
+              # Inspect bounded data in memory only. Returned values are fixed codes, not
+              # extracted lines, URLs, branch names, credential headers or server text.
+              raw = (stderr[-262144:] + b"\n" + stdout[-262144:]).lower()
+              if b"default branch" in raw and any(value in raw for value in (b"does not yet exist", b"does not exist", b"create a default branch")):
+                  return "DEFAULT_BRANCH_MISSING"
+              if any(value in raw for value in (b"protected tag", b"protected tags")):
+                  return "PROTECTED_TAG_REJECTED"
+              if any(value in raw for value in (b"protected branch", b"protected branches")):
+                  return "PROTECTED_BRANCH_REJECTED"
+              if b"stale info" in raw or b"cannot lock ref" in raw:
+                  return "LEASE_OR_REF_CONFLICT"
+              if b"does not support --atomic push" in raw or b"does not support atomic push" in raw:
+                  return "ATOMIC_UNSUPPORTED"
+              if any(value in raw for value in (b"storage limit", b"repository size limit", b"exceeds the size limit", b"exceeds maximum allowed size")):
+                  return "STORAGE_OR_OBJECT_LIMIT"
+              if any(value in raw for value in (b"not allowed to push code to this project", b"write access to repository not granted")):
+                  return "REPOSITORY_PUSH_PERMISSION_DENIED"
+              if any(value in raw for value in (b"authentication failed", b"http basic: access denied", b"could not read username", b"requested url returned error: 401", b"requested url returned error: 403")):
+                  return "AUTHENTICATION_OR_ACCESS_DENIED"
+              if b"pre-receive hook declined" in raw:
+                  return "PRE_RECEIVE_REJECTED"
+              if b"hook declined" in raw:
+                  return "REMOTE_HOOK_REJECTED"
+              if b"non-fast-forward" in raw:
+                  return "NON_FAST_FORWARD_REJECTED"
+              if b"atomic push failed" in raw:
+                  return "ATOMIC_PUSH_REJECTED"
+              if any(value in raw for value in (b"could not resolve host", b"failed to connect", b"connection timed out", b"connection reset", b"ssl certificate problem")):
+                  return "TRANSPORT_OR_TLS_FAILURE"
+              if b"remote rejected" in raw:
+                  return "REMOTE_REJECTED"
+              return "GIT_COMMAND_FAILED"
+          
+          
+          def run(args, *, cwd=None, env=None, data=None, operation="git_command"):
+              if operation not in GIT_OPERATIONS:
+                  raise MirrorError("Unknown trusted Git operation label; no command was started.")
               result = subprocess.run(args, cwd=cwd, env=env, input=data, stdout=subprocess.PIPE,
                                       stderr=subprocess.PIPE, check=False)
               if result.returncode:
-                  # Never include subprocess output: errors can echo credential headers or URLs.
-                  raise MirrorError("A Git validation or transfer failed; raw output suppressed.")
+                  code = classify_git_failure(result.stderr, result.stdout)
+                  raise MirrorError("Git operation failed: operation=" + operation + "; code=" + code + "; raw output suppressed.")
               return result.stdout
           
           
@@ -224,7 +264,7 @@ jobs:
               leases, specs = make_push_plan(source, target)
               if specs:
                   run(["git", "-c", "core.hooksPath=/dev/null", "push", "--atomic", "--porcelain", *(["--dry-run"] if dry_run else []),
-                       "-o", "ci.skip", *leases, remote, *specs], cwd=repo, env=env)
+                       "-o", "ci.skip", *leases, remote, *specs], cwd=repo, env=env, operation="atomic_push_dry_run" if dry_run else "atomic_push")
               return len(specs)
           
           
