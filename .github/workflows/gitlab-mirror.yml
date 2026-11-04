@@ -56,7 +56,7 @@ jobs:
           import urllib.parse
           import urllib.request
           
-          CONFIG = json.loads('{"source_id":986298509,"source_path":"houxujiang/wireless-regdb","target_id":88479746,"target_path":"houxujiang/wireless-regdb","expected_visibility":"public"}')  # The local generator replaces this with the reviewed per-repository pins.
+          CONFIG = json.loads('{"source_id":986298509,"source_path":"houxujiang/wireless-regdb","target_id":88479746,"target_path":"houxujiang/wireless-regdb","expected_visibility":"public","allow_empty_target_default_seed":true,"source_default_branch":"master"}')  # The local generator replaces this with the reviewed per-repository pins.
           REF_RE = re.compile(r"^[0-9a-f]{40,64}$")
           POINTER_RE = re.compile(rb"version https://git-lfs.github.com/spec/v1\noid sha256:([0-9a-f]{64})\nsize ([0-9]+)\n?")
           
@@ -161,6 +161,11 @@ jobs:
                   raise MirrorError("Expected public/private visibility must be explicitly pinned.")
               if require_target and (type(config.get("target_id")) is not int or config["target_id"] <= 0):
                   raise MirrorError("Verified GitLab numeric project identity is missing; sync forbidden.")
+              seed = config.get("allow_empty_target_default_seed", False)
+              if type(seed) is not bool:
+                  raise MirrorError("Empty-target default seed policy must be an explicit reviewed boolean.")
+              if seed and (not isinstance(config.get("source_default_branch"), str) or not config["source_default_branch"] or any(c in config["source_default_branch"] for c in "\r\n\t")):
+                  raise MirrorError("A verified source default-branch pin is required for an empty-target seed.")
               return config
           
           
@@ -179,6 +184,7 @@ jobs:
               expected_private = config["expected_visibility"] == "private"
               if not isinstance(repo, dict) or (repo.get("id"), repo.get("full_name"), repo.get("private")) != (config["source_id"], config["source_path"], expected_private):
                   raise MirrorError("Source identity/visibility changed or lookup failed. Pause for user review; do not update pins automatically.")
+              return {"default_branch": repo.get("default_branch")}
           
           
           def check_target(token, config):
@@ -241,6 +247,16 @@ jobs:
               return refs_from_output(run(["git", "ls-remote", "--refs", "--heads", "--tags", remote], env=env))
           
           
+          def remote_all_refs(remote, env):
+              refs = {}
+              for line in run(["git", "ls-remote", "--refs", remote], env=env).decode("utf-8").splitlines():
+                  oid, ref = line.split("\t", 1)
+                  if not REF_RE.fullmatch(oid) or not ref.startswith("refs/") or ref in refs:
+                      raise MirrorError("Unexpected complete destination reference advertisement.")
+                  refs[ref] = oid
+              return refs
+          
+          
           def local_refs(repo, env):
               return refs_from_output(run(["git", "for-each-ref", "--format=%(objectname)%09%(refname)",
                                            "refs/heads/", "refs/tags/"], cwd=repo, env=env))
@@ -260,12 +276,41 @@ jobs:
               return leases, specs
           
           
-          def push_refs(repo, source, target, env, remote, dry_run=False):
+          def push_refs(repo, source, target, env, remote, dry_run=False, operation=None):
               leases, specs = make_push_plan(source, target)
               if specs:
                   run(["git", "-c", "core.hooksPath=/dev/null", "push", "--atomic", "--porcelain", *(["--dry-run"] if dry_run else []),
-                       "-o", "ci.skip", *leases, remote, *specs], cwd=repo, env=env, operation="atomic_push_dry_run" if dry_run else "atomic_push")
+                       "-o", "ci.skip", *leases, remote, *specs], cwd=repo, env=env, operation=operation or ("atomic_push_dry_run" if dry_run else "atomic_push"))
               return len(specs)
+          
+          
+          def push_with_empty_default_seed(repo, source, target, env, remote, config, revalidate):
+              """Optional reviewed empty-target bootstrap; never a failed-push fallback.
+          
+              revalidate must freshly verify both privacy/identity pins and the unchanged
+              source ref snapshot. All LFS transfer/independent verification precedes this
+              function in main, exactly as for the ordinary leased atomic push.
+              """
+              actual_default = revalidate()
+              if not (config.get("allow_empty_target_default_seed") is True and not target and len(source) > 1):
+                  return push_refs(repo, source, target, env, remote)
+              pinned_default = config.get("source_default_branch")
+              default_ref = "refs/heads/" + pinned_default if isinstance(pinned_default, str) else None
+              if actual_default != pinned_default or default_ref not in source:
+                  raise MirrorError("Empty-target seed blocked: live source default branch differs from its verified pin or snapshot.")
+              if remote_all_refs(remote, env):
+                  raise MirrorError("Empty-target seed blocked: destination gained an advertised ref; no bootstrap or full push attempted.")
+              if revalidate() != pinned_default:
+                  raise MirrorError("Empty-target seed blocked: live source default changed before the anchor push.")
+              anchor = {default_ref: source[default_ref]}
+              summary("Phase: seed the verified source default branch into an empty advertised destination with an empty-value lease.")
+              count = push_refs(repo, anchor, {}, env, remote, operation="empty_default_seed")
+              if remote_all_refs(remote, env) != anchor:
+                  raise MirrorError("Empty-target seed postcondition failed: destination must contain exactly the anchored default ref/OID; no full push attempted.")
+              if revalidate() != pinned_default:
+                  raise MirrorError("Empty-target seed stopped: source identity/privacy/default or snapshot changed after anchoring; no full push attempted.")
+              summary("Phase: anchored destination verified; apply the remaining original atomic leased heads/tags plan.")
+              return count + push_refs(repo, source, anchor, env, remote)
           
           
           def scan_lfs(repo, env):
@@ -490,11 +535,13 @@ jobs:
                       verify_store.mkdir()
                       download_lfs(target_lfs_endpoint, target_lfs_headers, pointers, verify_store)
                   summary("Phase: recheck pinned visibility and current source refs immediately before atomic ref push.")
-                  check_source(github_token, config)
-                  check_target(gitlab_token, config)
-                  if source != remote_refs(source_remote, source_env):
-                      raise MirrorError("Source refs changed before push; retry required.")
-                  count = push_refs(repo, source, target, target_env, target_remote)
+                  def revalidate():
+                      source_metadata = check_source(github_token, config)
+                      check_target(gitlab_token, config)
+                      if source != remote_refs(source_remote, source_env):
+                          raise MirrorError("Source refs changed before push; retry required.")
+                      return source_metadata.get("default_branch")
+                  count = push_with_empty_default_seed(repo, source, target, target_env, target_remote, config, revalidate)
                   summary("Phase: verify both pinned visibility states and complete managed refs.")
                   check_source(github_token, config)
                   check_target(gitlab_token, config)
