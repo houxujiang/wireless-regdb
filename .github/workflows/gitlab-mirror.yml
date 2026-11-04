@@ -29,7 +29,7 @@ jobs:
     if: >-
       github.repository_id == '986298509' &&
       github.workflow_ref == 'houxujiang/wireless-regdb/.github/workflows/gitlab-mirror.yml@refs/heads/master' &&
-      (false || (github.event_name == 'workflow_dispatch' && inputs.mode == 'audit')) &&
+      (true || (github.event_name == 'workflow_dispatch' && inputs.mode == 'audit')) &&
       (github.event_name != 'workflow_run' ||
        (github.event.workflow_run.conclusion == 'success' &&
         github.event.workflow_run.head_repository.id == 986298509))
