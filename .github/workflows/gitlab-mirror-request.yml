@@ -1,0 +1,17 @@
+name: Request GitLab mirror
+
+on:
+  push:
+    branches: ['**']
+    tags: ['**']
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  request:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Request a refresh from the trusted default branch
+        run: echo 'GitLab mirror refresh requested; no repository code executed.'
