@@ -1,0 +1,496 @@
+name: Mirror GitHub repository to GitLab
+
+on:
+  workflow_run:
+    workflows: ['Request GitLab mirror']
+    types: [completed]
+  create:
+  delete:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Audit source, dry-run destination, or synchronize the pinned mirror
+        type: choice
+        options: [audit, dry-run, sync]
+        default: audit
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gitlab-mirror-986298509
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    if: >-
+      github.repository_id == '986298509' &&
+      github.workflow_ref == 'houxujiang/wireless-regdb/.github/workflows/gitlab-mirror.yml@refs/heads/master' &&
+      (false || (github.event_name == 'workflow_dispatch' && inputs.mode == 'audit')) &&
+      (github.event_name != 'workflow_run' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_repository.id == 986298509))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Prepare trusted inline mirror tool
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          cat > "$RUNNER_TEMP/github-gitlab-mirror.py" <<'PY'
+          """Trusted inline runner program; never loads or executes a repository worktree."""
+          import base64
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import shutil
+          import subprocess
+          import tempfile
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          
+          CONFIG = json.loads('{"source_id":986298509,"source_path":"houxujiang/wireless-regdb","target_id":88479746,"target_path":"houxujiang/wireless-regdb","expected_visibility":"public"}')  # The local generator replaces this with the reviewed per-repository pins.
+          REF_RE = re.compile(r"^[0-9a-f]{40,64}$")
+          POINTER_RE = re.compile(rb"version https://git-lfs.github.com/spec/v1\noid sha256:([0-9a-f]{64})\nsize ([0-9]+)\n?")
+          
+          
+          class MirrorError(Exception):
+              pass
+          
+          
+          def run(args, *, cwd=None, env=None, data=None):
+              result = subprocess.run(args, cwd=cwd, env=env, input=data, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE, check=False)
+              if result.returncode:
+                  # Never include subprocess output: errors can echo credential headers or URLs.
+                  raise MirrorError("A Git validation or transfer failed; raw output suppressed.")
+              return result.stdout
+          
+          
+          def safe_url(url):
+              parts = urllib.parse.urlsplit(url)
+              if parts.scheme != "https" or not parts.hostname or parts.username or parts.password:
+                  raise MirrorError("LFS server returned a non-HTTPS or credential-bearing URL.")
+              return url
+          
+          
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  # Keep authorization headers from being forwarded to a different host.
+                  return None
+          
+          
+          HTTP = urllib.request.build_opener(NoRedirect)
+          
+          
+          def request(url, *, headers=None, payload=None, method=None, output=None):
+              safe_url(url)
+              raw = json.dumps(payload).encode() if payload is not None else None
+              req = urllib.request.Request(url, data=raw, headers=headers or {}, method=method)
+              try:
+                  with HTTP.open(req, timeout=120) as response:
+                      if output:
+                          with open(output, "wb") as dest:
+                              shutil.copyfileobj(response, dest, 1024 * 1024)
+                          return None
+                      body = response.read(8 * 1024 * 1024 + 1)
+                      if len(body) > 8 * 1024 * 1024:
+                          raise MirrorError("API response exceeds the configured safety limit.")
+                      return json.loads(body) if body else None
+              except (urllib.error.URLError, ValueError, OSError):
+                  raise MirrorError("An authenticated API/LFS request failed; response suppressed.") from None
+          
+          
+          def validate_config(config, require_target=False):
+              if not isinstance(config, dict):
+                  raise MirrorError("Reviewed per-repository configuration is missing.")
+              if type(config.get("source_id")) is not int or config["source_id"] <= 0:
+                  raise MirrorError("Source numeric identity pin is missing.")
+              if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", config.get("source_path", "")):
+                  raise MirrorError("Invalid pinned GitHub repository path.")
+              if not re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+", config.get("target_path", "")):
+                  raise MirrorError("Invalid pinned GitLab project path.")
+              if config.get("expected_visibility") not in ("private", "public"):
+                  raise MirrorError("Expected public/private visibility must be explicitly pinned.")
+              if require_target and (type(config.get("target_id")) is not int or config["target_id"] <= 0):
+                  raise MirrorError("Verified GitLab numeric project identity is missing; sync forbidden.")
+              return config
+          
+          
+          def source_url(config):
+              return "https://github.com/" + config["source_path"] + ".git"
+          
+          
+          def target_url(config):
+              return "https://gitlab.com/" + config["target_path"] + ".git"
+          
+          
+          def check_source(token, config):
+              repo = request("https://api.github.com/repos/" + config["source_path"], headers={
+                  "Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28"})
+              expected_private = config["expected_visibility"] == "private"
+              if not isinstance(repo, dict) or (repo.get("id"), repo.get("full_name"), repo.get("private")) != (config["source_id"], config["source_path"], expected_private):
+                  raise MirrorError("Source identity/visibility changed or lookup failed. Pause for user review; do not update pins automatically.")
+          
+          
+          def check_target(token, config):
+              if not token:
+                  raise MirrorError("Missing GITLAB_MIRROR_TOKEN: no destination write was attempted.")
+              response = request("https://gitlab.com/api/graphql", headers={
+                  "Authorization": "Bearer " + token, "Content-Type": "application/json"},
+                  payload={"query": "query MirrorPrivacy($path: ID!) { project(fullPath: $path) { id fullPath visibility } }",
+                           "variables": {"path": config["target_path"]}})
+              if not isinstance(response, dict) or response.get("errors"):
+                  raise MirrorError("Destination visibility lookup failed; no push permitted.")
+              data = response.get("data")
+              project = data.get("project") if isinstance(data, dict) else None
+              if not isinstance(project, dict):
+                  raise MirrorError("Destination visibility lookup failed; no push permitted.")
+              visibility = project.get("visibility")
+              expected_id = "gid://gitlab/Project/" + str(config["target_id"])
+              if not isinstance(visibility, str) or (project.get("id"), project.get("fullPath"), visibility.lower()) != (expected_id, config["target_path"], config["expected_visibility"]):
+                  raise MirrorError("Destination identity/visibility changed or lookup failed. Pause for user review; no write permitted.")
+          
+          
+          def clean_git_environment():
+              # Remove inherited Git configuration/tracing controls before introducing only
+              # reviewed settings. This also prevents credential helpers from persisting PATs.
+              env = {k: v for k, v in os.environ.items()
+                     if not (k.startswith("GIT_") or k.startswith("GCM_") or k.startswith("GH_") or k.startswith("GL_"))}
+              return {**env, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+                      "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "Never", "GIT_ALLOW_PROTOCOL": "https"}
+          
+          
+          def basic_auth(username, token):
+              return "Basic " + base64.b64encode((username + ":" + token).encode()).decode()
+          
+          
+          def git_auth_environment(base, remote, username, token):
+              # Git URL-match scopes the header to this exact HTTPS repository path. Both
+              # credentials stay in separate subprocess environments; never in remote URLs.
+              safe_url(remote)
+              values = [("http." + remote + ".extraheader", "Authorization: " + basic_auth(username, token)),
+                        ("http.followRedirects", "false"), ("credential.helper", ""),
+                        ("core.hooksPath", os.devnull), ("core.askPass", "")]
+              env = {**base, "GIT_CONFIG_COUNT": str(len(values))}
+              for index, (key, value) in enumerate(values):
+                  env["GIT_CONFIG_KEY_" + str(index)] = key
+                  env["GIT_CONFIG_VALUE_" + str(index)] = value
+              return env
+          
+          
+          def refs_from_output(raw):
+              refs = {}
+              for line in raw.decode("utf-8").splitlines():
+                  oid, ref = line.split("\t", 1)
+                  if not REF_RE.fullmatch(oid) or not ref.startswith(("refs/heads/", "refs/tags/")):
+                      raise MirrorError("Unexpected reference data.")
+                  refs[ref] = oid
+              return refs
+          
+          
+          def remote_refs(remote, env):
+              return refs_from_output(run(["git", "ls-remote", "--refs", "--heads", "--tags", remote], env=env))
+          
+          
+          def local_refs(repo, env):
+              return refs_from_output(run(["git", "for-each-ref", "--format=%(objectname)%09%(refname)",
+                                           "refs/heads/", "refs/tags/"], cwd=repo, env=env))
+          
+          
+          def make_push_plan(source, target):
+              """Limit managed refs to heads/tags; lease every mutation, including creation."""
+              leases, specs = [], []
+              for ref in sorted(set(source) | set(target)):
+                  if not ref.startswith(("refs/heads/", "refs/tags/")):
+                      continue
+                  old, new = target.get(ref, ""), source.get(ref)
+                  if old == new:
+                      continue
+                  leases.append("--force-with-lease=" + ref + ":" + old)
+                  specs.append((new + ":" + ref) if new else (":" + ref))
+              return leases, specs
+          
+          
+          def push_refs(repo, source, target, env, remote, dry_run=False):
+              leases, specs = make_push_plan(source, target)
+              if specs:
+                  run(["git", "-c", "core.hooksPath=/dev/null", "push", "--atomic", "--porcelain", *(["--dry-run"] if dry_run else []),
+                       "-o", "ci.skip", *leases, remote, *specs], cwd=repo, env=env)
+              return len(specs)
+          
+          
+          def scan_lfs(repo, env):
+              # Fresh bare repository contains only source heads/tags and no worktree settings.
+              oids = run(["git", "rev-list", "--objects", "--all", "--no-object-names"], cwd=repo, env=env)
+              metadata = run(["git", "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"],
+                             cwd=repo, env=env, data=oids)
+              candidates = []
+              for line in metadata.splitlines():
+                  oid, kind, size = line.split()
+                  if kind == b"blob" and int(size) <= 1024:
+                      candidates.append((oid, int(size)))
+              pointers = {}
+              # One long-lived reader avoids spawning Git once per small historical blob.
+              # Request only known <=1024-byte blobs, and read each response immediately;
+              # large repository blobs are never loaded into Python memory.
+              process = subprocess.Popen(["git", "cat-file", "--batch"], cwd=repo, env=env,
+                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         stderr=subprocess.DEVNULL)
+              try:
+                  for oid, size in candidates:
+                      process.stdin.write(oid + b"\n")
+                      process.stdin.flush()
+                      header = process.stdout.readline(256)
+                      if header != oid + b" blob " + str(size).encode() + b"\n":
+                          raise MirrorError("Unexpected bounded Git object response during LFS scan.")
+                      content = process.stdout.read(size)
+                      if len(content) != size or process.stdout.read(1) != b"\n":
+                          raise MirrorError("Truncated bounded Git object response during LFS scan.")
+                      if not content.startswith(b"version https://git-lfs.github.com/spec/v1"):
+                          continue
+                      match = POINTER_RE.fullmatch(content)
+                      if not match:
+                          raise MirrorError("Unsupported/malformed LFS pointer detected; manual review required.")
+                      lfs_oid, lfs_size = match[1].decode(), int(match[2])
+                      if lfs_oid in pointers and pointers[lfs_oid] != lfs_size:
+                          raise MirrorError("LFS pointer size conflict.")
+                      pointers[lfs_oid] = lfs_size
+                  process.stdin.close()
+                  if process.wait() != 0:
+                      raise MirrorError("Git object batch reader failed during LFS scan.")
+              finally:
+                  if process.poll() is None:
+                      process.kill()
+                      process.wait()
+                  if not process.stdin.closed:
+                      process.stdin.close()
+                  process.stdout.close()
+              return pointers
+          
+          
+          def verified_file(path, oid, size):
+              if not path.exists() or path.stat().st_size != size:
+                  return False
+              digest = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for block in iter(lambda: stream.read(1024 * 1024), b""):
+                      digest.update(block)
+              return digest.hexdigest() == oid
+          
+          
+          def batch_lfs(endpoint, authorization, operation, pointers):
+              response = request(endpoint + "/objects/batch", headers={
+                  **authorization, "Content-Type": "application/vnd.git-lfs+json",
+                  "Accept": "application/vnd.git-lfs+json"}, payload={
+                      "operation": operation, "transfers": ["basic"],
+                      "objects": [{"oid": oid, "size": size} for oid, size in pointers.items()]})
+              objects = response.get("objects")
+              if not isinstance(objects, list) or len(objects) != len(pointers):
+                  raise MirrorError("Unexpected LFS batch response.")
+              found = set()
+              for obj in objects:
+                  if obj.get("error") or obj.get("oid") not in pointers or obj.get("size") != pointers[obj["oid"]]:
+                      raise MirrorError("LFS object was unavailable or had unexpected metadata.")
+                  if obj["oid"] in found:
+                      raise MirrorError("LFS batch contained duplicate objects.")
+                  found.add(obj["oid"])
+              return objects
+          
+          
+          def action_headers(action, endpoint, authorization):
+              supplied = action.get("header", {})
+              if not isinstance(supplied, dict):
+                  raise MirrorError("Malformed LFS action headers.")
+              href = safe_url(action.get("href", ""))
+              actual, pinned = urllib.parse.urlsplit(href), urllib.parse.urlsplit(endpoint)
+              # Only fall back to the original PAT inside the pinned repository URL scope.
+              # Object-store URLs receive only the action-specific headers returned by the
+              # official batch endpoint, never an automatically attached GitHub/GitLab PAT.
+              repository_path = pinned.path.removesuffix("/info/lfs").rstrip("/") + "/"
+              same_scope = (actual.scheme, actual.netloc) == (pinned.scheme, pinned.netloc) and actual.path.startswith(repository_path)
+              return {**(authorization if same_scope else {}), **supplied}
+          
+          
+          def download_lfs(endpoint, authorization, pointers, storage):
+              for start in range(0, len(pointers), 50):
+                  group = dict(list(pointers.items())[start:start + 50])
+                  for obj in batch_lfs(endpoint, authorization, "download", group):
+                      action = obj.get("actions", {}).get("download")
+                      if not isinstance(action, dict) or not action.get("href"):
+                          raise MirrorError("LFS download action missing.")
+                      path = storage / obj["oid"]
+                      request(action["href"], headers=action_headers(action, endpoint, authorization), output=path)
+                      if not verified_file(path, obj["oid"], obj["size"]):
+                          raise MirrorError("Downloaded LFS object failed SHA256/size verification.")
+          
+          
+          def upload_lfs(endpoint, authorization, pointers, storage):
+              for start in range(0, len(pointers), 50):
+                  group = dict(list(pointers.items())[start:start + 50])
+                  for obj in batch_lfs(endpoint, authorization, "upload", group):
+                      action = obj.get("actions", {}).get("upload")
+                      if action:
+                          path = storage / obj["oid"]
+                          if not verified_file(path, obj["oid"], obj["size"]):
+                              raise MirrorError("Local LFS object failed verification before upload.")
+                          # Streaming request body; urllib accepts a binary file object.
+                          with path.open("rb") as stream:
+                              req = urllib.request.Request(safe_url(action["href"]), data=stream,
+                                  method="PUT", headers={"Content-Length": str(obj["size"]),
+                                  "Content-Type": "application/octet-stream", **action_headers(action, endpoint, authorization)})
+                              try:
+                                  with HTTP.open(req, timeout=120) as response:
+                                      response.read(1024)
+                              except (urllib.error.URLError, OSError):
+                                  raise MirrorError("LFS upload failed; response suppressed.") from None
+                      verify = obj.get("actions", {}).get("verify")
+                      if verify:
+                          request(verify["href"], headers={"Content-Type": "application/vnd.git-lfs+json",
+                                  **action_headers(verify, endpoint, authorization)}, payload={"oid": obj["oid"], "size": obj["size"]})
+          
+          
+          
+          def summary(text):
+              print(text, flush=True)
+              if os.environ.get("GITHUB_STEP_SUMMARY"):
+                  with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as out:
+                      out.write(text + "\n")
+          
+          
+          def main():
+              github_token = os.environ.pop("GH_READ_TOKEN", "")
+              gitlab_token = os.environ.pop("GL_MIRROR_TOKEN", "")
+              mode = os.environ.get("MIRROR_MODE", "audit")
+              if not github_token or mode not in ("audit", "dry-run", "sync"):
+                  raise MirrorError("Missing source credential or invalid execution mode.")
+              config = validate_config(CONFIG, require_target=(mode != "audit"))
+              source_remote, target_remote = source_url(config), target_url(config)
+              summary("Phase: verify pinned source identity and visibility.")
+              check_source(github_token, config)
+              if mode != "audit":
+                  summary("Phase: verify pinned destination identity and visibility before reading history.")
+                  check_target(gitlab_token, config)
+              with tempfile.TemporaryDirectory(prefix="github-gitlab-mirror-") as temp:
+                  root = Path(temp)
+                  root.chmod(0o700)
+                  empty_template = root / "empty-template"
+                  empty_template.mkdir()
+                  env = clean_git_environment()
+                  source_env = git_auth_environment(env, source_remote, "x-access-token", github_token)
+                  target_env = git_auth_environment(env, target_remote, "oauth2", gitlab_token) if mode != "audit" else None
+                  repo = root / "source.git"
+                  summary("Phase: fetch complete source branch and tag history into a fresh bare repository.")
+                  run(["git", "init", "--bare", "--template=" + str(empty_template), str(repo)], env=env)
+                  run(["git", "fetch", "--no-recurse-submodules", "--no-tags", source_remote,
+                       "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"], cwd=repo, env=source_env)
+                  summary("Phase: verify reachable Git objects.")
+                  run(["git", "fsck", "--full", "--strict"], cwd=repo, env=env)
+                  source = local_refs(repo, env)
+                  if not source or source != remote_refs(source_remote, source_env):
+                      raise MirrorError("Source refs changed during fetch; retry required.")
+                  summary("Phase: scan all reachable history for LFS pointers.")
+                  pointers = scan_lfs(repo, env)
+                  ci_branches = 0
+                  for ref in source:
+                      if ref.startswith("refs/heads/"):
+                          tree = run(["git", "ls-tree", "--name-only", ref, "--", ".gitlab-ci.yml"], cwd=repo, env=env)
+                          ci_branches += bool(tree.strip())
+                  lfs_store = root / "lfs"
+                  lfs_store.mkdir()
+                  summary("Phase: download and verify source LFS objects, if any.")
+                  download_lfs(source_remote + "/info/lfs", {"Authorization": basic_auth("x-access-token", github_token)}, pointers, lfs_store)
+                  branches = sum(ref.startswith("refs/heads/") for ref in source)
+                  tags = len(source) - branches
+                  summary(f"Source verified: {branches} branches, {tags} tags, {len(pointers)} LFS objects ({sum(pointers.values())} bytes). Full reachable Git history passed fsck.")
+                  summary(f"GitLab CI configuration exists in {ci_branches} branch roots. Pushes request ci.skip; target CI/CD must also be disabled for this mirror-only project.")
+                  for ref, oid in sorted(source.items()):
+                      summary(f"{ref} {oid}")
+                  if mode == "audit":
+                      summary("Audit complete. No GitLab credential was used and no destination write was attempted.")
+                      return
+                  summary("Phase: verify destination access and dry-run the exact leased atomic ref plan.")
+                  check_source(github_token, config)
+                  check_target(gitlab_token, config)
+                  target = remote_refs(target_remote, target_env)
+                  planned = push_refs(repo, source, target, target_env, target_remote, dry_run=True)
+                  target_lfs_endpoint = target_remote + "/info/lfs"
+                  target_lfs_headers = {"Authorization": basic_auth("oauth2", gitlab_token)}
+                  if pointers:
+                      # A download batch request is read-only. Missing objects are expected
+                      # on an empty target and prevent a complete LFS dry-run success claim.
+                      try:
+                          batch_lfs(target_lfs_endpoint, target_lfs_headers, "download", pointers)
+                          summary("Destination LFS download metadata check passed for all source objects.")
+                      except MirrorError:
+                          if mode == "dry-run":
+                              raise MirrorError("Destination LFS objects are absent or access could not be verified; dry-run did not write any objects.")
+                          summary("Destination LFS download precheck could not verify all source objects; sync must upload and independently verify them.")
+                  if mode == "dry-run":
+                      check_source(github_token, config)
+                      check_target(gitlab_token, config)
+                      if source != remote_refs(source_remote, source_env):
+                          raise MirrorError("Source refs changed during dry-run; retry required.")
+                      summary(f"Destination Git dry-run passed for {planned} planned ref mutations. No refs or LFS objects were written. A dry-run does not prove server hooks, branch-protection acceptance, quota capacity, or successful LFS uploads.")
+                      return
+                  if pointers:
+                      summary("Phase: recheck visibility, then upload and independently verify destination LFS objects.")
+                      check_source(github_token, config)
+                      check_target(gitlab_token, config)
+                      upload_lfs(target_lfs_endpoint, target_lfs_headers, pointers, lfs_store)
+                      verify_store = root / "target-lfs-verification"
+                      verify_store.mkdir()
+                      download_lfs(target_lfs_endpoint, target_lfs_headers, pointers, verify_store)
+                  summary("Phase: recheck pinned visibility and current source refs immediately before atomic ref push.")
+                  check_source(github_token, config)
+                  check_target(gitlab_token, config)
+                  if source != remote_refs(source_remote, source_env):
+                      raise MirrorError("Source refs changed before push; retry required.")
+                  count = push_refs(repo, source, target, target_env, target_remote)
+                  summary("Phase: verify both pinned visibility states and complete managed refs.")
+                  check_source(github_token, config)
+                  check_target(gitlab_token, config)
+                  final_target = remote_refs(target_remote, target_env)
+                  final_source = remote_refs(source_remote, source_env)
+                  if final_target != source or final_source != source:
+                      raise MirrorError("Post-push ref verification failed or source advanced; retry required.")
+                  summary(f"Mirror verified: all {branches} branches, {tags} tags, and {len(pointers)} LFS objects match. {count} refs changed; pinned visibility remains {config['expected_visibility']}.")
+          
+          
+          if __name__ == "__main__":
+              try:
+                  main()
+              except MirrorError as error:
+                  summary("FAILED: " + str(error))
+                  raise SystemExit(1)
+              except Exception:
+                  summary("FAILED: unexpected validation/transfer error; details suppressed to protect credentials.")
+                  raise SystemExit(1)
+          PY
+      - name: Audit source without GitLab credentials
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'audit'
+        shell: bash
+        env:
+          GH_READ_TOKEN: ${{ github.token }}
+          MIRROR_MODE: audit
+        run: python3 "$RUNNER_TEMP/github-gitlab-mirror.py"
+      - name: Verify pins and dry-run or synchronize
+        if: github.event_name != 'workflow_dispatch' || inputs.mode != 'audit'
+        shell: bash
+        env:
+          GH_READ_TOKEN: ${{ github.token }}
+          GL_MIRROR_TOKEN: ${{ secrets.GITLAB_MIRROR_TOKEN }}
+          MIRROR_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'sync' }}
+        run: python3 "$RUNNER_TEMP/github-gitlab-mirror.py"
+      - name: Record failure
+        if: failure()
+        shell: bash
+        run: echo 'Mirror failed. Review the sanitized summary. Visibility changes require user review; never update pins automatically.' >> "$GITHUB_STEP_SUMMARY"
